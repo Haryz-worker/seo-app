@@ -7,3 +7,4 @@ w3lib>=2.2
 tldextract>=5.1
 langdetect>=1.0.9
 uvicorn
+fastapi
