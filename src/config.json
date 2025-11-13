@@ -1,0 +1,23 @@
+{
+  "http": {
+    "engine": "httpx",
+    "timeout": 25,
+    "retries": 2,
+    "http2": true,
+    "proxy": null,
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
+  },
+  "paths": {
+    "save_dir": "data/cache",
+    "reports_dir": "data/reports",
+    "input_file": "src/Input.json"
+  },
+  "thresholds": {
+    "title_chars": [30, 70],
+    "title_px": [285, 580],
+    "meta_chars": [80, 160],
+    "meta_px": [430, 920],
+    "min_words": 800,
+    "min_internal_links": 3
+  }
+}

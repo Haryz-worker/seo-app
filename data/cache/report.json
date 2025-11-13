@@ -1,0 +1,96 @@
+{
+  "generated_at": "2025-11-08T09:06:39.316546Z",
+  "headings": {
+    "h1": {
+      "similarity_to_title": 1.0,
+      "text": "BMI Calculator for Men vs Women (2025): The Complete Guide to Gender Differences, Health Risks, and Accurate Results"
+    },
+    "h2_count": 17,
+    "h3_count": 10,
+    "heading_density_per_1000_words": 12.65,
+    "words_per_h2_avg": 125.5
+  },
+  "keywords": [
+    {
+      "density_pct": 0.379,
+      "in_description": true,
+      "in_h1": true,
+      "in_h2_count": 4,
+      "in_h3_count": 0,
+      "in_title": true,
+      "in_url": false,
+      "occurrences": 8,
+      "term": "bmi calculator for men vs women"
+    }
+  ],
+  "links": {
+    "counts": {
+      "external": 6,
+      "external_ratio": 0.75,
+      "internal": 2,
+      "internal_ratio": 0.25,
+      "total": 8
+    },
+    "external_links": [
+      {
+        "url": "https://www.calculator.net/body-fat-calculator.html"
+      },
+      {
+        "url": "https://www.cdc.gov/bmi/adult-calculator/index.html"
+      },
+      {
+        "url": "https://www.cdc.gov/bmi/adult-calculator/index.html"
+      },
+      {
+        "url": "https://www.who.int/data/gho/data/themes/topics/topic-details/GHO/body-mass-index"
+      },
+      {
+        "url": "https://www.nhlbi.nih.gov/health/heart-healthy-living/healthy-weight"
+      },
+      {
+        "url": "https://www.healthline.com/health/exercise-fitness/ideal-body-fat-percentage"
+      }
+    ],
+    "internal_links": [
+      {
+        "url": "https://fitnovahealth.com/bmi-calculator-for-men-women/"
+      },
+      {
+        "url": "https://fitnovahealth.com/bmi-calculator-for-men-vs-women-2025/"
+      }
+    ]
+  },
+  "meta_description": {
+    "length_chars": 158,
+    "pixels_est": 1106,
+    "status_chars": "ok",
+    "status_pixels": "long",
+    "text": "Understand how BMI Calculator for Men vs Women work differently . Deep dive into gender differences in BMI, interpretation, health risks, and expert insights."
+  },
+  "overview": {
+    "language": "en-US",
+    "score": 56,
+    "warnings": [
+      "few internal links: 2 (< 3)"
+    ],
+    "word_count": 2134
+  },
+  "readability": {
+    "avg_sentence_length": 16.67,
+    "flesch_reading_ease": 50.33,
+    "sentences": 128
+  },
+  "seo_title": {
+    "length_chars": 116,
+    "pixels_est": 867,
+    "status_chars": "long",
+    "status_pixels": "long",
+    "text": "BMI Calculator for Men vs Women (2025): The Complete Guide to Gender Differences, Health Risks, and Accurate Results"
+  },
+  "source_file": "fitnovahealth.com_bmi-calculator-for-men-vs-women-2025.json",
+  "technical": {
+    "canonical_present": true,
+    "lang_present": true,
+    "robots_present": true
+  }
+}

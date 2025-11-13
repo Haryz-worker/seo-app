@@ -1,0 +1,6 @@
+# include core requirements
+-r ../requirements.txt
+
+# add backend-specific
+fastapi>=0.115
+uvicorn[standard]>=0.30

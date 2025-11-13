@@ -1,0 +1,19 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv*/
+.venv*/
+.env
+.DS_Store
+
+# data
+data/cache/*.html
+data/cache/*.tmp
+data/reports/*.tmp
+
+# editors
+.vscode/
+.idea/
