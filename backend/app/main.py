@@ -1,10 +1,10 @@
-# backend/app/main.py
 import os
 import time
 from typing import List
 
-from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, HTMLResponse
 
 from .schemas import AnalyzeRequest, AnalyzeResponse, HealthResponse
 from .service import run_pipeline
@@ -16,7 +16,6 @@ RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
 
 app = FastAPI(title="OnPage SEO API", version="1.0.0")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else ["*"],
@@ -25,12 +24,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Rate limiter (in-memory)
 limiter = RateLimiter(RATE_LIMIT_PER_MIN, window_seconds=60)
 
-
 def auth_dep(request: Request):
-    """Bearer token check (disabled if API_TOKEN is empty)."""
     if not API_TOKEN:
         return
     hdr = request.headers.get("Authorization", "")
@@ -40,18 +36,14 @@ def auth_dep(request: Request):
     if token != API_TOKEN:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid token")
 
-
 def rate_limit_dep(request: Request):
-    """Basic per-IP rate limiting."""
     ip = request.client.host if request.client else "unknown"
     if not limiter.hit(ip):
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
-
 @app.get("/health", response_model=HealthResponse)
 def health():
     return HealthResponse(ok=True, ts=int(time.time()))
-
 
 @app.post(
     "/analyze-page",
@@ -59,11 +51,7 @@ def health():
     dependencies=[Depends(auth_dep), Depends(rate_limit_dep)],
 )
 def analyze(req: AnalyzeRequest):
-    """
-    Run: fetch → extract → analyze
-    """
     try:
-        # مهم: حوّل HttpUrl إلى string قبل تمريـره
         url_str = str(req.url)
         keyword_str = (req.keyword or "").strip() or None
 
@@ -77,8 +65,44 @@ def analyze(req: AnalyzeRequest):
             report=report,
         )
     except HTTPException:
-        # لو auth/rate-limit رما Exception خليه يمر كما هو
         raise
     except Exception as e:
-        # رجّع خطأ واضح للـ client
         raise HTTPException(status_code=500, detail=str(e))
+
+# --------- NEW: GET /report (for WordPress form or iframe) ----------
+@app.get("/report")
+def get_report(
+    u: str = Query(..., description="Target URL (e.g. https://example.com)"),
+    k: str = Query("", description="Focus keyword (optional)"),
+    view: str = Query("json", description="View mode: json or html")
+):
+    try:
+        report_path, report = run_pipeline(url=u, keyword=k.strip() or None)
+    except Exception as e:
+        if view == "html":
+            return HTMLResponse(
+                f"<pre style='color:#b91c1c;font-weight:bold'>Error: {str(e)}</pre>", status_code=500
+            )
+        return JSONResponse({"detail": str(e)}, status_code=500)
+
+    if view == "html":
+        # Simple HTML output (you can customize this for a prettier report)
+        html = f"""
+        <div style="max-width:720px;margin:0 auto;font-family:sans-serif;">
+            <h2 style="color:#2563eb;">SEO Analysis for<br><span style='font-size:17px;color:#333'>{u}</span></h2>
+            <hr>
+            <h3>SEO Score: <span style='color:#16a34a'>{report['overview']['score']}</span></h3>
+            <h4>SEO Title: <span style='color:#0e7490'>{report['seo_title']['text']}</span></h4>
+            <h4>Meta Description: <span style='color:#0e7490'>{report['meta_description']['text']}</span></h4>
+            <h4>Word Count: <span style='color:#333'>{report['overview']['word_count']}</span></h4>
+            <h4>Warnings:</h4>
+            <ul>
+            {''.join(f'<li style=\"color:#b91c1c\">{w}</li>' for w in report['overview'].get('warnings', []))}
+            </ul>
+            <hr>
+            <pre style="white-space:pre-wrap;background:#f1f5f9;padding:9px 13px;border-radius:9px">{report_path}</pre>
+        </div>
+        """
+        return HTMLResponse(html, status_code=200)
+
+    return JSONResponse(report, status_code=200)
