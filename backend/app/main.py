@@ -69,7 +69,6 @@ def analyze(req: AnalyzeRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --------- GET /report (returns only JSON) ----------
 @app.get("/report")
 def get_report(
     u: str = Query(..., description="Target URL (e.g. https://example.com)"),
@@ -79,5 +78,4 @@ def get_report(
         report_path, report = run_pipeline(url=u, keyword=k.strip() or None)
     except Exception as e:
         return JSONResponse({"detail": str(e)}, status_code=500)
-
     return JSONResponse(report, status_code=200)
