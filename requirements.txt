@@ -9,3 +9,7 @@ langdetect>=1.0.9
 uvicorn
 fastapi
 httpx[http2]
+##
+sitemap-parser
+beautifulsoup4
+robotexclusionrulesparser
