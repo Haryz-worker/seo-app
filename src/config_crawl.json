@@ -1,0 +1,7 @@
+{
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/118.0.0.0 Safari/537.36",
+  "timeout": 15,
+  "max_links": 60,
+  "input_file": "src/Input_domain.json",
+  "output_dir": "data/reports/"
+}

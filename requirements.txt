@@ -10,6 +10,6 @@ uvicorn
 fastapi
 httpx[http2]
 ##
-sitemap-parser
+
 beautifulsoup4
 robotexclusionrulesparser
