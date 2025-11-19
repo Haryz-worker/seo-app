@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import logging
 from typing import Optional
 
@@ -196,7 +195,13 @@ async def crawl_status() -> CrawlStatus:
     import sys
 
     print("[*] /crawl/status endpoint called", file=sys.stderr)
-    return get_crawl_status()
+    status_obj = get_crawl_status()
+    log.info(
+        "[/crawl/status] job_id=%s status=%s",
+        status_obj.job_id,
+        status_obj.status,
+    )
+    return status_obj
 
 
 # ---------------------------------------------------------------------------
@@ -213,30 +218,55 @@ def simple_crawl_report():
       - index_status / meta_robots
       - internal_links: list of {url, status}
       - external_links: list of {url, status}
+    Data is taken from the crawl status cache (crawl_status.json).
     """
-    REPORT_PATH = "data/reports/fitnovahealth_com_report.json"
+    import sys
 
-    try:
-        with open(REPORT_PATH, "r", encoding="utf-8") as f:
-            crawl_data = json.load(f)
-    except Exception as ex:
-        log.warning("Crawl report not found or invalid: %s", ex)
+    print("[*] /crawl/report/simple endpoint called", file=sys.stderr)
+
+    status_obj = get_crawl_status()
+    log.info(
+        "[/crawl/report/simple] job_id=%s status=%s",
+        status_obj.job_id,
+        status_obj.status,
+    )
+
+    if not status_obj.reports or len(status_obj.reports) == 0:
+        log.warning(
+            "[/crawl/report/simple] No reports available (status=%s)",
+            status_obj.status,
+        )
         return JSONResponse(
-            content={"error": f"Report not found or invalid: {ex}"},
+            content={
+                "error": "No crawl report available yet",
+                "job_id": status_obj.job_id,
+                "status": status_obj.status,
+            },
             status_code=404,
         )
 
+    # For now we assume a single-domain crawl and use the first report
+    report = status_obj.reports[0]
+
     simple = []
-    for page in crawl_data.get("pages", []):
+    for page in report.pages:
+        # extra debug per page (can be noisy but useful while testing)
+        log.debug(
+            "[/crawl/report/simple] page url=%s status=%s internal=%d external=%d",
+            page.url,
+            page.status,
+            len(page.internal_links),
+            len(page.external_links),
+        )
+
         simple.append(
             {
-                "url": page.get("url"),
-                "status": page.get("status"),
-                "index_status": page.get("index_status"),
-                "meta_robots": page.get("meta_robots"),
-                # internal/external are already list of {url, status}
-                "internal_links": page.get("internal_links") or [],
-                "external_links": page.get("external_links") or [],
+                "url": page.url,
+                "status": page.status,
+                "index_status": page.index_status,
+                "meta_robots": page.meta_robots,
+                "internal_links": [link.dict() for link in page.internal_links],
+                "external_links": [link.dict() for link in page.external_links],
             }
         )
 
