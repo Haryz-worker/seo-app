@@ -200,14 +200,19 @@ async def crawl_status() -> CrawlStatus:
 
 
 # ---------------------------------------------------------------------------
-# Simple crawl report (latest crawl: url + status only)
+# Simple crawl report (latest crawl: page + links info)
 # ---------------------------------------------------------------------------
 
 @app.get("/crawl/report/simple")
 def simple_crawl_report():
     """
-    Return a simple list of {url, status} for the latest crawled domain.
-    Adjust REPORT_PATH if you want a different report file.
+    Return a simple list for the latest crawled domain.
+
+    Each item contains:
+      - page URL and HTTP status
+      - index_status / meta_robots
+      - internal_links: list of {url, status}
+      - external_links: list of {url, status}
     """
     REPORT_PATH = "data/reports/fitnovahealth_com_report.json"
 
@@ -221,8 +226,18 @@ def simple_crawl_report():
             status_code=404,
         )
 
-    simple = [
-        {"url": page.get("url"), "status": page.get("status")}
-        for page in crawl_data.get("pages", [])
-    ]
+    simple = []
+    for page in crawl_data.get("pages", []):
+        simple.append(
+            {
+                "url": page.get("url"),
+                "status": page.get("status"),
+                "index_status": page.get("index_status"),
+                "meta_robots": page.get("meta_robots"),
+                # internal/external are already list of {url, status}
+                "internal_links": page.get("internal_links") or [],
+                "external_links": page.get("external_links") or [],
+            }
+        )
+
     return JSONResponse(content=simple, status_code=200)
