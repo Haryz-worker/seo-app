@@ -78,7 +78,17 @@ def crawl_single_url(
     cfg: CrawlConfig,
     cache_root: Optional[Path] = None,
     index: int = 0,
+    **legacy_kwargs: Any,
 ) -> PageCrawlResult:
+    """
+    Crawl a single URL and extract it to JSON.
+
+    legacy_kwargs is used to support old callers that pass cache=...
+    """
+    # Backwards compatibility: accept "cache=" keyword
+    if cache_root is None and "cache" in legacy_kwargs:
+        cache_root = legacy_kwargs.get("cache")
+
     if cache_root is None:
         cache_root = get_cache_dir()
 
@@ -291,7 +301,7 @@ def crawl_domain(domain: DomainInput, cfg: CrawlConfig) -> DomainCrawlReport:
             url=url,
             domain=domain,
             cfg=cfg,
-            cache=cache_root,
+            cache=cache_root,  # legacy keyword handled inside crawl_single_url
             index=index,
         )
         pages.append(res)
