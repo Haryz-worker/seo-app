@@ -1,7 +1,14 @@
 {
-  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/118.0.0.0 Safari/537.36",
-  "timeout": 15,
-  "max_links": 60,
-  "input_file": "src/Input_domain.json",
-  "output_dir": "data/reports/"
+  "http": {
+    "engine": "httpx",
+    "timeout": 5,
+    "retries": 1,
+    "http2": true,
+    "proxy": null,
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/118.0.0.0 Safari/537.36"
+  },
+  "limits": {
+    "max_pages_per_domain": 500,
+    "delay_ms_between_requests": 0
+  }
 }
