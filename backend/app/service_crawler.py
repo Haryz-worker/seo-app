@@ -1,367 +1,300 @@
-# src/core/domain_crawler.py
+# backend/app/service_crawler.py
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass, field, asdict
+import uuid
+import traceback
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import List, Optional, Dict, Any
 
-from .fetcher import fetch
-from .extractor import html_bytes_to_json
-from .utils import ensure_dir, save_json, load_json
-from .util_crawler import (
+from src.core.domain_crawler import crawl_domain
+from src.core.util_crawler import (
     CrawlConfig,
     DomainInput,
     get_cache_dir,
     get_reports_dir,
-    is_url_allowed_for_domain,
+    load_crawl_config,
+    load_domain_inputs,
 )
 
+from .schemas_crawler import (
+    CrawlBody,
+    CrawlStatus,
+    DomainReport,
+    PageResult,
+)
 
-# ---------------------------------------------------------------------------
-# Dataclasses
-# ---------------------------------------------------------------------------
-
-@dataclass
-class PageCrawlResult:
-    url: str
-    final_url: str
-    status: Optional[int]
-    duration_ms: int
-    size_bytes: int
-    encoding_guess: Optional[str]
-    ok: bool
-    error: Optional[str] = None
-    extracted_path: Optional[str] = None
-
-    # index / robots info (filled after reading extracted JSON)
-    meta_robots: Optional[str] = None
-    index_status: Optional[str] = None  # "index", "noindex", or None
-
-    # links on this page (filled after reading extracted JSON)
-    internal_links: List[Dict[str, Any]] = field(default_factory=list)
-    external_links: List[Dict[str, Any]] = field(default_factory=list)
+STATUS_FILENAME = "crawl_status.json"
 
 
-@dataclass
-class DomainCrawlReport:
-    domain: str
-    slug: str
-    started_at: float
-    finished_at: float
-    config: Dict[str, Any]
-    pages: List[PageCrawlResult] = field(default_factory=list)
+# ------------------------------------------------------------
+# JSON STATUS FILE HELPERS
+# ------------------------------------------------------------
 
-    @property
-    def duration_ms(self) -> int:
-        return int((self.finished_at - self.started_at) * 1000)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "domain": self.domain,
-            "slug": self.slug,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "duration_ms": self.duration_ms,
-            "config": self.config,
-            "pages": [asdict(p) for p in self.pages],
-        }
+def _status_path() -> Path:
+    return get_cache_dir() / STATUS_FILENAME
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _read_status_raw() -> Dict[str, Any]:
+    path = _status_path()
+    if not path.exists():
+        return {}
+    try:
+        import json
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-def _page_save_path(cache_root: Path, slug: str, index: int, status: Optional[int]) -> Path:
-    status_part = status if status is not None else "unknown"
-    fname = f"{index:04d}_{status_part}.json"
-    d = cache_root / slug
-    ensure_dir(str(d))
-    return d / fname
+
+def _write_status_raw(data: Dict[str, Any]) -> None:
+    path = _status_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    import json
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
 
 
-def crawl_single_url(
-    url: str,
-    domain: DomainInput,
-    cfg: CrawlConfig,
-    cache_root: Optional[Path] = None,
-    index: int = 0,
-    **legacy_kwargs: Any,
-) -> PageCrawlResult:
-    """
-    Crawl a single URL and extract it to JSON.
+# ------------------------------------------------------------
+# HELPERS
+# ------------------------------------------------------------
 
-    legacy_kwargs is used to support old callers that pass cache=...
-    """
-    # Support old keyword name: cache
-    if cache_root is None and "cache" in legacy_kwargs:
-        cache_root = legacy_kwargs.get("cache")
+def _slug_from_domain(dom: str) -> str:
+    dom = dom.strip().lower()
+    dom = dom.replace("https://", "").replace("http://", "").strip("/")
+    return dom.replace(".", "_").replace("/", "_") or "domain"
 
-    if cache_root is None:
-        cache_root = get_cache_dir()
 
-    ok, meta, content = fetch(
-        url=url,
-        ua=cfg.http.user_agent or "",
-        engine=cfg.http.engine,
-        timeout=cfg.http.timeout,
-        http2=cfg.http.http2,
-        retries=cfg.http.retries,
-        proxy=cfg.http.proxy,
+def _make_root_url(domain: str) -> str:
+    """Normalize domain to a proper full root URL."""
+    d = domain.strip()
+    if not d.startswith("http"):
+        d = "https://" + d
+    if not d.endswith("/"):
+        d += "/"
+    return d
+
+
+def _domain_from_body(body: CrawlBody) -> DomainInput:
+    """Convert simple CrawlBody to DomainInput used by the crawler engine."""
+    root_url = _make_root_url(body.domain)
+    slug = _slug_from_domain(body.domain)
+
+    return DomainInput(
+        domain=body.domain,
+        slug=slug,
+        start_urls=[root_url],
+        max_pages=body.max_pages,
+        allowed_paths=[],
+        blocked_paths=[],
     )
 
-    status = meta.get("status")
-    final_url = meta.get("final_url") or url
-    duration_ms = int(meta.get("duration_ms") or 0)
-    size_bytes = int(meta.get("size_bytes") or 0)
-    enc = meta.get("encoding_guess")
 
-    if not ok or not content:
-        return PageCrawlResult(
-            url=url,
-            final_url=final_url,
-            status=status,
-            duration_ms=duration_ms,
-            size_bytes=size_bytes,
-            encoding_guess=enc,
-            ok=False,
-            error="fetch_failed",
-            extracted_path=None,
+def _load_domains_from_request(body: Optional[CrawlBody]) -> List[DomainInput]:
+    if body is not None:
+        return [_domain_from_body(body)]
+    return load_domain_inputs()
+
+
+# ------------------------------------------------------------
+# PUBLIC FUNCTIONS
+# ------------------------------------------------------------
+
+def start_crawl_job(body: Optional[CrawlBody]) -> CrawlStatus:
+    job_id = str(uuid.uuid4())
+    status = CrawlStatus(
+        job_id=job_id,
+        status="pending",
+        message="scheduled",
+        reports=None,
+    )
+    _write_status_raw(status.dict())
+    return status
+
+
+def run_crawl_job_sync(job_id: str, body: Optional[CrawlBody]) -> None:
+    """
+    Synchronous crawl runner used by the background task.
+
+    This function is heavily logged so that errors on Render are visible
+    in the service logs.
+    """
+    import sys
+    from logging import getLogger
+
+    log = getLogger("onpage_api")
+
+    print(f"[CRAWL] run_crawl_job_sync start job_id={job_id} body={body}", file=sys.stderr)
+    log.info("[CRAWL] run_crawl_job_sync start job_id=%s body=%s", job_id, body)
+
+    cfg: CrawlConfig = load_crawl_config()
+    domains: List[DomainInput] = _load_domains_from_request(body)
+
+    print(f"[CRAWL] config={cfg} domains={domains}", file=sys.stderr)
+    log.info("[CRAWL] config=%s domains_count=%d", cfg, len(domains))
+
+    # write: running status
+    _write_status_raw(
+        {
+            "job_id": job_id,
+            "status": "running",
+            "message": f"Running crawl for {len(domains)} domain(s)",
+            "reports": [],
+        }
+    )
+
+    reports_out: List[Dict[str, Any]] = []
+
+    try:
+        # loop on domains
+        for domain in domains:
+            print(f"[CRAWL] crawling domain={domain.domain} slug={domain.slug}", file=sys.stderr)
+            log.info("[CRAWL] crawling domain=%s slug=%s", domain.domain, domain.slug)
+
+            report = crawl_domain(domain, cfg)
+            report_path = str(get_reports_dir() / f"{domain.slug}_report.json")
+
+            print(
+                f"[CRAWL] domain finished domain={report.domain} pages={len(report.pages)} "
+                f"duration_ms={report.duration_ms}",
+                file=sys.stderr,
+            )
+            log.info(
+                "[CRAWL] domain finished domain=%s pages=%d duration_ms=%d",
+                report.domain,
+                len(report.pages),
+                report.duration_ms,
+            )
+
+            pages_models: List[Dict[str, Any]] = []
+
+            for p in report.pages:
+                # base fields
+                page_dict: Dict[str, Any] = {
+                    "url": p.url,
+                    "final_url": p.final_url,
+                    "status": p.status,
+                    "duration_ms": p.duration_ms,
+                    "size_bytes": p.size_bytes,
+                    "encoding_guess": p.encoding_guess,
+                    "ok": p.ok,
+                    "error": p.error,
+                    "extracted_path": p.extracted_path,
+                }
+
+                # index and robots info (optional on older reports)
+                page_dict["meta_robots"] = getattr(p, "meta_robots", None)
+                page_dict["index_status"] = getattr(p, "index_status", None)
+
+                # links: list of {url, status}
+                internal_links = getattr(p, "internal_links", []) or []
+                external_links = getattr(p, "external_links", []) or []
+
+                norm_internal: List[Dict[str, Any]] = []
+                for it in internal_links:
+                    if isinstance(it, dict):
+                        norm_internal.append(
+                            {
+                                "url": it.get("url"),
+                                "status": it.get("status"),
+                            }
+                        )
+                    else:
+                        norm_internal.append({"url": str(it), "status": None})
+
+                norm_external: List[Dict[str, Any]] = []
+                for it in external_links:
+                    if isinstance(it, dict):
+                        norm_external.append(
+                            {
+                                "url": it.get("url"),
+                                "status": it.get("status"),
+                            }
+                        )
+                    else:
+                        norm_external.append({"url": str(it), "status": None})
+
+                page_dict["internal_links"] = norm_internal
+                page_dict["external_links"] = norm_external
+
+                pages_models.append(page_dict)
+
+            reports_out.append(
+                {
+                    "domain": report.domain,
+                    "slug": domain.slug,
+                    "duration_ms": report.duration_ms,
+                    "report_path": report_path,
+                    "pages": pages_models,
+                }
+            )
+
+        # write: done
+        _write_status_raw(
+            {
+                "job_id": job_id,
+                "status": "done",
+                "message": f"Completed crawl for {len(domains)} domain(s)",
+                "reports": reports_out,
+            }
         )
 
-    save_path = _page_save_path(cache_root, domain.slug, index=index, status=status)
-    extracted_path = html_bytes_to_json(
-        html_bytes=content,
-        final_url=final_url,
-        save_path=str(save_path),
-        base_override=None,
-        pretty=True,
-        compact=False,
-    )
+        print(f"[CRAWL] job_id={job_id} finished OK", file=sys.stderr)
+        log.info("[CRAWL] job_id=%s finished OK", job_id)
 
-    return PageCrawlResult(
-        url=url,
-        final_url=final_url,
-        status=status,
-        duration_ms=duration_ms,
-        size_bytes=size_bytes,
-        encoding_guess=enc,
-        ok=True,
-        error=None,
-        extracted_path=str(extracted_path),
-    )
+    except Exception as e:
+        # log full traceback to stderr and logger so it appears in Render logs
+        traceback.print_exc(file=sys.stderr)
+        log.exception("[CRAWL] run_crawl_job_sync FAILED job_id=%s error=%s", job_id, e)
 
-
-def _extract_internal_links(json_path: str, domain: DomainInput) -> List[str]:
-    """
-    Old helper: read the extracted JSON and return a list of allowed internal URLs.
-    Kept for backward compatibility. New code uses _extract_links_and_index_info.
-    """
-    try:
-        data = load_json(json_path)
-    except Exception:
-        return []
-
-    links = data.get("links", {})
-    internal = links.get("internal_links") or []
-    urls: List[str] = []
-    for item in internal:
-        if not isinstance(item, dict):
-            continue
-        u = item.get("url")
-        if isinstance(u, str) and is_url_allowed_for_domain(u, domain):
-            urls.append(u)
-    # simple unique while preserving order
-    seen = set()
-    out: List[str] = []
-    for u in urls:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
-
-
-def _extract_links_and_index_info(
-    json_path: str,
-    domain: DomainInput,
-) -> Dict[str, Any]:
-    """
-    Read extracted JSON and return:
-
-      - meta_robots (raw string)
-      - index_status: "index" / "noindex" / None
-      - internal_urls: list of URLs allowed for BFS
-      - internal_links: list of {url, status} for reporting
-      - external_links: list of {url, status} for reporting
-    """
-    try:
-        data = load_json(json_path)
-    except Exception:
-        return {
-            "meta_robots": None,
-            "index_status": None,
-            "internal_urls": [],
-            "internal_links": [],
-            "external_links": [],
-        }
-
-    page = data.get("page", {}) or {}
-    links = data.get("links", {}) or {}
-
-    meta_robots = page.get("meta_robots")
-    index_status: Optional[str] = None
-
-    if isinstance(meta_robots, str):
-        low = meta_robots.lower()
-        if "noindex" in low:
-            index_status = "noindex"
-        else:
-            index_status = "index"
-
-    internal_raw = links.get("internal_links") or []
-    external_raw = links.get("external_links") or []
-
-    # Internal URLs for BFS + link objects for reporting
-    internal_urls: List[str] = []
-    internal_links: List[Dict[str, Any]] = []
-    for item in internal_raw:
-        if not isinstance(item, dict):
-            continue
-        u = item.get("url")
-        if not isinstance(u, str):
-            continue
-        if not is_url_allowed_for_domain(u, domain):
-            continue
-        internal_urls.append(u)
-        internal_links.append({"url": u, "status": None})
-
-    # External links (only for reporting; we do not filter by domain)
-    external_links: List[Dict[str, Any]] = []
-    for item in external_raw:
-        if not isinstance(item, dict):
-            continue
-        u = item.get("url")
-        if not isinstance(u, str):
-            continue
-        external_links.append({"url": u, "status": None})
-
-    # Deduplicate internal_urls while preserving order
-    seen = set()
-    uniq_internal_urls: List[str] = []
-    for u in internal_urls:
-        if u not in seen:
-            seen.add(u)
-            uniq_internal_urls.append(u)
-
-    return {
-        "meta_robots": meta_robots,
-        "index_status": index_status,
-        "internal_urls": uniq_internal_urls,
-        "internal_links": internal_links,
-        "external_links": external_links,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Main crawl entrypoint
-# ---------------------------------------------------------------------------
-
-def crawl_domain(domain: DomainInput, cfg: CrawlConfig) -> DomainCrawlReport:
-    """
-    Crawl a single domain using the existing fetcher + extractor stack.
-
-    Strategy:
-    - Start from domain.start_urls (usually the root URL derived from `domain`).
-    - For each crawled page, read its JSON and enqueue internal links (BFS).
-    - For each page, also extract:
-        * meta_robots
-        * index_status (index / noindex)
-        * internal_links (url + status)
-        * external_links (url + status)
-    - Continue until `max_pages` is reached for that domain.
-    """
-    started = time.time()
-    pages: List[PageCrawlResult] = []
-
-    max_pages = domain.max_pages or cfg.limits.max_pages_per_domain
-
-    # BFS queue
-    queue: List[str] = []
-    seen: set[str] = set()
-
-    # seed queue with start_urls
-    for u in domain.start_urls:
-        if is_url_allowed_for_domain(u, domain):
-            if u not in seen:
-                queue.append(u)
-
-    cache_root = get_cache_dir()
-
-    while queue and len(pages) < max_pages:
-        url = queue.pop(0)
-        if url in seen:
-            continue
-        seen.add(url)
-
-        index = len(pages)
-        res = crawl_single_url(
-            url=url,
-            domain=domain,
-            cfg=cfg,
-            cache_root=cache_root,
-            index=index,
+        _write_status_raw(
+            {
+                "job_id": job_id,
+                "status": "failed",
+                "message": f"Error: {e}",
+                "reports": reports_out,
+            }
         )
-        pages.append(res)
 
-        # Optional delay between requests
-        if cfg.limits.delay_ms_between_requests > 0:
-            time.sleep(cfg.limits.delay_ms_between_requests / 1000.0)
+        print(f"[CRAWL] job_id={job_id} failed error={e}", file=sys.stderr)
 
-        # If extraction succeeded, read links + robots info and enqueue internal links
-        if res.ok and res.extracted_path:
-            info = _extract_links_and_index_info(res.extracted_path, domain)
 
-            # Attach extra info to this page result
-            res.meta_robots = info["meta_robots"]
-            res.index_status = info["index_status"]
-            res.internal_links = info["internal_links"]
-            res.external_links = info["external_links"]
+def get_crawl_status() -> CrawlStatus:
+    raw = _read_status_raw()
+    if not raw:
+        return CrawlStatus(
+            job_id="none",
+            status="idle",
+            message="No crawl job has been started yet",
+            reports=None,
+        )
 
-            # Enqueue internal URLs for BFS
-            for nu in info["internal_urls"]:
-                if nu not in seen and nu not in queue:
-                    queue.append(nu)
-                    if len(pages) + len(queue) >= max_pages:
-                        # enough scheduled URLs, no need to keep adding
-                        break
+    try:
+        reports_raw = raw.get("reports") or []
+        reports_models: List[DomainReport] = []
 
-    finished = time.time()
-    report = DomainCrawlReport(
-        domain=domain.domain,
-        slug=domain.slug,
-        started_at=started,
-        finished_at=finished,
-        config={
-            "http": {
-                "engine": cfg.http.engine,
-                "timeout": cfg.http.timeout,
-                "retries": cfg.http.retries,
-                "http2": cfg.http.http2,
-                "proxy": cfg.http.proxy,
-            },
-            "limits": {
-                "max_pages_per_domain": cfg.limits.max_pages_per_domain,
-                "delay_ms_between_requests": cfg.limits.delay_ms_between_requests,
-            },
-            "max_pages_effective": max_pages,
-        },
-        pages=pages,
-    )
+        for r in reports_raw:
+            pages_models = [PageResult(**p) for p in r.get("pages", [])]
+            reports_models.append(
+                DomainReport(
+                    domain=r.get("domain", ""),
+                    slug=r.get("slug", ""),
+                    duration_ms=int(r.get("duration_ms") or 0),
+                    report_path=r.get("report_path", ""),
+                    pages=pages_models,
+                )
+            )
 
-    # save one JSON per domain under data/reports
-    reports_root = get_reports_dir()
-    fname = f"{domain.slug}_report.json"
-    path = reports_root / fname
-    save_json(str(path), report.to_dict(), pretty=True, compact=False)
+        return CrawlStatus(
+            job_id=str(raw.get("job_id", "")),
+            status=str(raw.get("status", "")),
+            message=raw.get("message"),
+            reports=reports_models or None,
+        )
 
-    return report
+    except Exception:
+        return CrawlStatus(
+            job_id="invalid",
+            status="error",
+            message="Failed to parse crawl status file",
+            reports=None,
+                )
