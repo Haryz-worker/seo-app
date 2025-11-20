@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import uuid
+import traceback
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
@@ -111,8 +112,25 @@ def start_crawl_job(body: Optional[CrawlBody]) -> CrawlStatus:
 
 
 def run_crawl_job_sync(job_id: str, body: Optional[CrawlBody]) -> None:
+    """
+    Synchronous crawl runner used by the background task.
+
+    This function is heavily logged so that errors on Render are visible
+    in the service logs.
+    """
+    import sys
+    from logging import getLogger
+
+    log = getLogger("onpage_api")
+
+    print(f"[CRAWL] run_crawl_job_sync start job_id={job_id} body={body}", file=sys.stderr)
+    log.info("[CRAWL] run_crawl_job_sync start job_id=%s body=%s", job_id, body)
+
     cfg: CrawlConfig = load_crawl_config()
     domains: List[DomainInput] = _load_domains_from_request(body)
+
+    print(f"[CRAWL] config={cfg} domains={domains}", file=sys.stderr)
+    log.info("[CRAWL] config=%s domains_count=%d", cfg, len(domains))
 
     # write: running status
     _write_status_raw(
@@ -129,8 +147,23 @@ def run_crawl_job_sync(job_id: str, body: Optional[CrawlBody]) -> None:
     try:
         # loop on domains
         for domain in domains:
+            print(f"[CRAWL] crawling domain={domain.domain} slug={domain.slug}", file=sys.stderr)
+            log.info("[CRAWL] crawling domain=%s slug=%s", domain.domain, domain.slug)
+
             report = crawl_domain(domain, cfg)
             report_path = str(get_reports_dir() / f"{domain.slug}_report.json")
+
+            print(
+                f"[CRAWL] domain finished domain={report.domain} pages={len(report.pages)} "
+                f"duration_ms={report.duration_ms}",
+                file=sys.stderr,
+            )
+            log.info(
+                "[CRAWL] domain finished domain=%s pages=%d duration_ms=%d",
+                report.domain,
+                len(report.pages),
+                report.duration_ms,
+            )
 
             pages_models: List[Dict[str, Any]] = []
 
@@ -156,7 +189,6 @@ def run_crawl_job_sync(job_id: str, body: Optional[CrawlBody]) -> None:
                 internal_links = getattr(p, "internal_links", []) or []
                 external_links = getattr(p, "external_links", []) or []
 
-                # ensure they are serializable lists of dicts
                 norm_internal: List[Dict[str, Any]] = []
                 for it in internal_links:
                     if isinstance(it, dict):
@@ -206,8 +238,14 @@ def run_crawl_job_sync(job_id: str, body: Optional[CrawlBody]) -> None:
             }
         )
 
+        print(f"[CRAWL] job_id={job_id} finished OK", file=sys.stderr)
+        log.info("[CRAWL] job_id=%s finished OK", job_id)
+
     except Exception as e:
-        # write: failure
+        # log full traceback to stderr and logger so it appears in Render logs
+        traceback.print_exc(file=sys.stderr)
+        log.exception("[CRAWL] run_crawl_job_sync FAILED job_id=%s error=%s", job_id, e)
+
         _write_status_raw(
             {
                 "job_id": job_id,
@@ -216,6 +254,8 @@ def run_crawl_job_sync(job_id: str, body: Optional[CrawlBody]) -> None:
                 "reports": reports_out,
             }
         )
+
+        print(f"[CRAWL] job_id={job_id} failed error={e}", file=sys.stderr)
 
 
 def get_crawl_status() -> CrawlStatus:
