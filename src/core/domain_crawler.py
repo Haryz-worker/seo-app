@@ -5,10 +5,9 @@ import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .fetcher import fetch
-from .extractorV import html_bytes_to_json  # variant extractor for crawler
+from .extractorV import html_bytes_to_json
 from .utils import ensure_dir, save_json, load_json, is_http
 from .util_crawler import (
     CrawlConfig,
@@ -18,22 +17,10 @@ from .util_crawler import (
     is_url_allowed_for_domain,
 )
 
-# ----------------------------------------------------------------------
-# Tunable limits (Render-friendly)
-# ----------------------------------------------------------------------
 
-# How many internal links per page to probe status for
-MAX_INTERNAL_LINKS_PER_PAGE = 30
-
-# How many external links per page to probe status for
-MAX_EXTERNAL_LINKS_PER_PAGE = 10
-
-# Timeout used when probing link status (seconds)
-LINK_PROBE_TIMEOUT_SEC = 2.0
-
-# Max worker threads for link probes
-LINK_PROBE_WORKERS = 5
-
+# -------------------------------------------------------------------
+# Data Models
+# -------------------------------------------------------------------
 
 @dataclass
 class PageCrawlResult:
@@ -51,7 +38,11 @@ class PageCrawlResult:
     meta_robots: Optional[str] = None
     index_status: Optional[str] = None  # "index" / "noindex" / None
 
-    # link lists for this page (list of {url, status})
+    # date-related fields
+    publish_date: Optional[str] = None
+    modified_date: Optional[str] = None
+
+    # link lists for this page (list of {raw, abs, status})
     internal_links: List[Dict[str, Any]] = field(default_factory=list)
     external_links: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -81,6 +72,10 @@ class DomainCrawlReport:
         }
 
 
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+
 def _page_save_path(cache_root: Path, slug: str, index: int, status: Optional[int]) -> Path:
     status_part = status if status is not None else "unknown"
     fname = f"{index:04d}_{status_part}.json"
@@ -97,11 +92,6 @@ def crawl_single_url(
     index: int = 0,
     **legacy_kwargs: Any,
 ) -> PageCrawlResult:
-    """
-    Fetch and extract a single URL.
-
-    legacy_kwargs is used to support old callers that pass cache=...
-    """
     if cache_root is None and "cache" in legacy_kwargs:
         cache_root = legacy_kwargs.get("cache")
 
@@ -142,7 +132,6 @@ def crawl_single_url(
         html_bytes=content,
         final_url=final_url,
         save_path=str(save_path),
-        base_override=None,
         pretty=True,
         compact=False,
     )
@@ -155,121 +144,67 @@ def crawl_single_url(
         size_bytes=size_bytes,
         encoding_guess=enc,
         ok=True,
-        error=None,
         extracted_path=str(extracted_path),
     )
 
 
-def _extract_links_and_index_info(
-    json_path: str,
-    domain: DomainInput,
-) -> Dict[str, Any]:
-    """
-    Read extracted JSON and return:
-      - internal_urls_for_bfs: list of internal URLs to enqueue in BFS
-      - internal_links_urls: all internal link URLs on this page
-      - external_links_urls: all external link URLs on this page
-      - meta_robots and index_status
-    """
+def _extract_data_from_json(json_path: str, domain: DomainInput) -> Dict[str, Any]:
+    """Parse extractorV output and return useful info for crawler."""
     try:
         data = load_json(json_path)
     except Exception:
         return {
-            "internal_urls_for_bfs": [],
-            "internal_links_urls": [],
-            "external_links_urls": [],
+            "internal": [],
+            "external": [],
             "meta_robots": None,
             "index_status": None,
+            "publish_date": None,
+            "modified_date": None,
         }
 
     page = data.get("page", {}) or {}
-    robots = page.get("meta_robots")
-    index_status: Optional[str] = None
-    if isinstance(robots, str) and robots.strip():
-        low = robots.lower()
-        if "noindex" in low:
-            index_status = "noindex"
-        else:
-            index_status = "index"
-
     links = data.get("links", {}) or {}
-    internal_items = links.get("internal_links") or []
-    external_items = links.get("external_links") or []
 
-    internal_urls_for_bfs: List[str] = []
-    internal_links_urls: List[str] = []
-    external_links_urls: List[str] = []
+    robots = page.get("meta_robots")
+    index_status = None
+    if isinstance(robots, str):
+        low = robots.lower()
+        index_status = "noindex" if "noindex" in low else "index"
 
-    tmp_internal: List[str] = []
-    for item in internal_items:
-        if not isinstance(item, dict):
-            continue
-        u = item.get("url")
-        if not isinstance(u, str):
-            continue
-        if not is_http(u):
-            continue
-        if is_url_allowed_for_domain(u, domain):
-            tmp_internal.append(u)
+    all_internal: List[Dict[str, Any]] = []
+    all_external: List[Dict[str, Any]] = []
 
-    seen_int = set()
-    for u in tmp_internal:
-        if u not in seen_int:
-            seen_int.add(u)
-            internal_links_urls.append(u)
-            internal_urls_for_bfs.append(u)
+    for obj in links.get("internal", []):
+        raw = obj.get("raw")
+        absu = obj.get("abs")
+        if absu and is_url_allowed_for_domain(absu, domain):
+            all_internal.append({"raw": raw, "abs": absu})
 
-    tmp_external: List[str] = []
-    for item in external_items:
-        if not isinstance(item, dict):
-            continue
-        u = item.get("url")
-        if not isinstance(u, str):
-            continue
-        if not is_http(u):
-            continue
-        tmp_external.append(u)
-
-    seen_ext = set()
-    for u in tmp_external:
-        if u not in seen_ext:
-            seen_ext.add(u)
-            external_links_urls.append(u)
-
-    # Limit how many links we keep per page (Render safety)
-    internal_links_urls = internal_links_urls[:MAX_INTERNAL_LINKS_PER_PAGE]
-    external_links_urls = external_links_urls[:MAX_EXTERNAL_LINKS_PER_PAGE]
-    internal_urls_for_bfs = internal_urls_for_bfs[:MAX_INTERNAL_LINKS_PER_PAGE]
+    for obj in links.get("external", []):
+        raw = obj.get("raw")
+        absu = obj.get("abs")
+        all_external.append({"raw": raw, "abs": absu})
 
     return {
-        "internal_urls_for_bfs": internal_urls_for_bfs,
-        "internal_links_urls": internal_links_urls,
-        "external_links_urls": external_links_urls,
+        "internal": all_internal,
+        "external": all_external,
         "meta_robots": robots,
         "index_status": index_status,
+        "publish_date": page.get("publish_date"),
+        "modified_date": page.get("modified_date"),
     }
 
 
-def _probe_link_status_single(
-    url: str,
-    cfg: CrawlConfig,
-    cache: Dict[str, Optional[int]],
-) -> Optional[int]:
-    """
-    Return HTTP status for a single link URL, with cache.
-    Uses a shorter timeout than main page fetch.
-    """
+def _probe_status(url: str, cfg: CrawlConfig, cache: Dict[str, Optional[int]]) -> Optional[int]:
+    """Fetch the URL once and cache its HTTP status."""
     if url in cache:
         return cache[url]
-
-    # Use a shorter timeout for link probes
-    timeout = min(cfg.http.timeout, LINK_PROBE_TIMEOUT_SEC)
 
     ok, meta, _ = fetch(
         url=url,
         ua=cfg.http.user_agent or "",
         engine=cfg.http.engine,
-        timeout=timeout,
+        timeout=cfg.http.timeout,
         http2=cfg.http.http2,
         retries=cfg.http.retries,
         proxy=cfg.http.proxy,
@@ -279,59 +214,11 @@ def _probe_link_status_single(
     return status
 
 
-def _probe_link_status_bulk(
-    urls: List[str],
-    cfg: CrawlConfig,
-    cache: Dict[str, Optional[int]],
-) -> Dict[str, Optional[int]]:
-    """
-    Probe multiple link URLs in parallel using a small thread pool.
-    Returns dict {url: status}.
-    """
-    results: Dict[str, Optional[int]] = {}
-
-    # First fill from cache
-    to_fetch: List[str] = []
-    for u in urls:
-        if u in cache:
-            results[u] = cache[u]
-        else:
-            to_fetch.append(u)
-
-    if not to_fetch:
-        return results
-
-    with ThreadPoolExecutor(max_workers=LINK_PROBE_WORKERS) as executor:
-        future_to_url = {
-            executor.submit(_probe_link_status_single, u, cfg, cache): u
-            for u in to_fetch
-        }
-        for future in as_completed(future_to_url):
-            u = future_to_url[future]
-            try:
-                status = future.result()
-            except Exception:
-                status = None
-                cache[u] = None
-            results[u] = status
-
-    return results
-
+# -------------------------------------------------------------------
+# Crawler Core Logic
+# -------------------------------------------------------------------
 
 def crawl_domain(domain: DomainInput, cfg: CrawlConfig) -> DomainCrawlReport:
-    """
-    Crawl a single domain using the existing fetcher + extractor stack.
-
-    Strategy:
-    - Start from domain.start_urls.
-    - For each crawled page:
-        * fetch + extract (via extractorV)
-        * read meta_robots and infer index/noindex
-        * read internal/external links from JSON
-        * probe HTTP status for a limited number of internal/external links
-        * enqueue internal links only (BFS)
-    - Continue until max_pages is reached or queue is empty.
-    """
     started = time.time()
     pages: List[PageCrawlResult] = []
 
@@ -340,12 +227,13 @@ def crawl_domain(domain: DomainInput, cfg: CrawlConfig) -> DomainCrawlReport:
     queue: List[str] = []
     seen: set[str] = set()
 
+    # status cache for speed
     link_status_cache: Dict[str, Optional[int]] = {}
 
+    # seed queue
     for u in domain.start_urls:
         if is_url_allowed_for_domain(u, domain):
-            if u not in seen and u not in queue:
-                queue.append(u)
+            queue.append(u)
 
     cache_root = get_cache_dir()
 
@@ -360,50 +248,48 @@ def crawl_domain(domain: DomainInput, cfg: CrawlConfig) -> DomainCrawlReport:
             url=url,
             domain=domain,
             cfg=cfg,
-            cache=cache_root,
+            cache_root=cache_root,
             index=index,
         )
         pages.append(res)
 
-        if res.final_url:
-            link_status_cache.setdefault(res.final_url, res.status)
-        link_status_cache.setdefault(res.url, res.status)
+        # cache page status
+        link_status_cache[res.final_url] = res.status
+        link_status_cache[res.url] = res.status
 
         if cfg.limits.delay_ms_between_requests > 0:
             time.sleep(cfg.limits.delay_ms_between_requests / 1000.0)
 
         if res.ok and res.extracted_path:
-            info = _extract_links_and_index_info(res.extracted_path, domain)
+            info = _extract_data_from_json(res.extracted_path, domain)
 
             res.meta_robots = info["meta_robots"]
             res.index_status = info["index_status"]
+            res.publish_date = info["publish_date"]
+            res.modified_date = info["modified_date"]
 
-            internal_urls = info["internal_links_urls"]
-            external_urls = info["external_links_urls"]
+            # internal links
+            res.internal_links = []
+            for obj in info["internal"]:
+                absu = obj.get("abs")
+                raw = obj.get("raw")
+                status_int = _probe_status(absu, cfg, link_status_cache)
+                res.internal_links.append({"raw": raw, "abs": absu, "status": status_int})
 
-            internal_statuses = _probe_link_status_bulk(
-                internal_urls, cfg, link_status_cache
-            )
-            external_statuses = _probe_link_status_bulk(
-                external_urls, cfg, link_status_cache
-            )
+                # BFS enqueue
+                if absu not in seen and absu not in queue and len(pages) < max_pages:
+                    queue.append(absu)
 
-            res.internal_links = [
-                {"url": u, "status": internal_statuses.get(u)}
-                for u in internal_urls
-            ]
-            res.external_links = [
-                {"url": u, "status": external_statuses.get(u)}
-                for u in external_urls
-            ]
-
-            for nu in info["internal_urls_for_bfs"]:
-                if nu not in seen and nu not in queue:
-                    queue.append(nu)
-                    if len(pages) + len(queue) >= max_pages:
-                        break
+            # external links
+            res.external_links = []
+            for obj in info["external"]:
+                absu = obj.get("abs")
+                raw = obj.get("raw")
+                status_ext = _probe_status(absu, cfg, link_status_cache)
+                res.external_links.append({"raw": raw, "abs": absu, "status": status_ext})
 
     finished = time.time()
+
     report = DomainCrawlReport(
         domain=domain.domain,
         slug=domain.slug,
