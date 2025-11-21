@@ -1,4 +1,5 @@
 # src/core/util_crawler.py
+
 from __future__ import annotations
 
 import json
@@ -10,7 +11,10 @@ from .utils import ensure_dir, host_key, norm_url, dedup, is_http
 
 
 def get_project_root() -> Path:
-    """Return the absolute project root (folder that contains `src` and `backend`)."""
+    """
+    Return the absolute project root (folder that contains `src` and `backend`).
+    Example: /.../onpage-seo-app
+    """
     here = Path(__file__).resolve()
     # .../src/core/util_crawler.py -> project root is parents[2]
     return here.parents[2]
@@ -37,6 +41,10 @@ def get_reports_dir() -> Path:
 
 
 def load_json_safe(path: Path, default: Any) -> Any:
+    """
+    Load JSON file if it exists, otherwise return default.
+    Any parse error also returns default.
+    """
     if not path.exists():
         return default
     try:
@@ -45,6 +53,10 @@ def load_json_safe(path: Path, default: Any) -> Any:
     except Exception:
         return default
 
+
+# ---------------------------------------------------------------------------
+# Crawl config
+# ---------------------------------------------------------------------------
 
 @dataclass
 class CrawlHttpSettings:
@@ -69,11 +81,49 @@ class CrawlConfig:
 
 
 def load_crawl_config() -> CrawlConfig:
-    """Load crawl config from src/config_crawl.json if it exists."""
+    """
+    Load crawl config from src/config_crawl.json if it exists.
+
+    Supports two shapes:
+
+    1) Nested (recommended):
+       {
+         "http": {
+           "engine": "httpx",
+           "timeout": 15,
+           "retries": 2,
+           "http2": true,
+           "proxy": null,
+           "user_agent": "..."
+         },
+         "limits": {
+           "max_pages_per_domain": 300,
+           "delay_ms_between_requests": 0
+         }
+       }
+
+    2) Flat (backward compatible):
+       {
+         "user_agent": "...",
+         "timeout": 15,
+         "retries": 2,
+         "http2": true,
+         "proxy": null,
+         "max_pages_per_domain": 300,
+         "delay_ms_between_requests": 0
+       }
+    """
     cfg_path = get_src_root() / "config_crawl.json"
     raw = load_json_safe(cfg_path, default={})
-    http_raw = raw.get("http", {})
-    limits_raw = raw.get("limits", {})
+
+    # If nested keys exist, use them.
+    if isinstance(raw, dict) and ("http" in raw or "limits" in raw):
+        http_raw = raw.get("http", {})
+        limits_raw = raw.get("limits", {})
+    else:
+        # Flat shape, treat whole object as http, and limits from same root
+        http_raw = raw if isinstance(raw, dict) else {}
+        limits_raw = raw.get("limits", {}) if isinstance(raw, dict) else {}
 
     http = CrawlHttpSettings(
         engine=http_raw.get("engine", "httpx"),
@@ -83,15 +133,34 @@ def load_crawl_config() -> CrawlConfig:
         proxy=http_raw.get("proxy"),
         user_agent=http_raw.get("user_agent"),
     )
+
     limits = CrawlLimits(
-        max_pages_per_domain=int(limits_raw.get("max_pages_per_domain", 20)),
-        delay_ms_between_requests=int(limits_raw.get("delay_ms_between_requests", 0)),
+        max_pages_per_domain=int(
+            limits_raw.get(
+                "max_pages_per_domain",
+                raw.get("max_pages_per_domain", 20) if isinstance(raw, dict) else 20,
+            )
+        ),
+        delay_ms_between_requests=int(
+            limits_raw.get(
+                "delay_ms_between_requests",
+                raw.get("delay_ms_between_requests", 0) if isinstance(raw, dict) else 0,
+            )
+        ),
     )
+
     return CrawlConfig(http=http, limits=limits)
 
 
+# ---------------------------------------------------------------------------
+# Domain input
+# ---------------------------------------------------------------------------
+
 @dataclass
 class DomainInput:
+    """
+    A normalized description of a domain to crawl.
+    """
     domain: str
     slug: str
     start_urls: List[str]
@@ -137,13 +206,11 @@ def _normalize_domain_item(item: Dict[str, Any]) -> Optional[DomainInput]:
 
     urls: List[str] = []
 
-    # If the JSON has explicit URLs (start_urls / urls), use them
     for key in ("start_urls", "urls"):
-        raw = item.get(key)
-        if isinstance(raw, list):
-            urls.extend([str(u) for u in raw if isinstance(u, str)])
+        raw_urls = item.get(key)
+        if isinstance(raw_urls, list):
+            urls.extend([str(u) for u in raw_urls if isinstance(u, str)])
 
-    # Fallback: only domain is provided → crawl the root URL
     if not urls and domain:
         if is_http(domain):
             root = domain
@@ -195,14 +262,18 @@ def _normalize_domain_item(item: Dict[str, Any]) -> Optional[DomainInput]:
 
 
 def load_domain_inputs() -> List[DomainInput]:
-    """Load domain inputs from src/Input_domain.json.
+    """
+    Load domain inputs from src/Input_domain.json.
 
     Minimal example:
 
     [
-      { "domain": "https://fitnovahealth.com", "max_pages": 10 },
-      { "domain": "dailyboom.com", "max_pages": 5 }
+      { "domain": "https://fitnovahealth.com", "max_pages": 300 },
+      { "domain": "dailyboom.com", "max_pages": 50 }
     ]
+
+    You can also use:
+    { "domains": [ ... ] }
     """
     path = get_src_root() / "Input_domain.json"
     raw = load_json_safe(path, default=[])
@@ -229,7 +300,8 @@ def load_domain_inputs() -> List[DomainInput]:
 
 
 def is_url_allowed_for_domain(url: str, domain: DomainInput) -> bool:
-    """Basic domain-level filtering for a URL.
+    """
+    Basic domain-level filtering for a URL.
 
     - Must match same host_key.
     - Must not contain any blocked_paths (if provided).
