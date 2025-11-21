@@ -1,10 +1,13 @@
 # src/core/extractorV.py
+from __future__ import annotations
+
 import os
-import itertools
 import re
-from typing import Optional, List, Dict
-from urllib.parse import urlparse, urljoin
+import json
+from urllib.parse import urljoin, urlparse
+
 from datetime import datetime
+from typing import List, Dict, Optional, Any
 
 from lxml import html as LH
 from readability import Document
@@ -14,119 +17,116 @@ from .utils import (
     clean_space,
     is_http,
     norm_url,
-    host_key,
     dedup,
-    detect_lang_fallback,
-    count_words,
     ensure_dir,
     save_json,
+    host_key,
 )
 
-SOCIAL_HOSTS = {
-    "facebook.com",
-    "twitter.com",
-    "x.com",
-    "linkedin.com",
-    "pinterest.com",
-    "wa.me",
-    "api.whatsapp.com",
-    "t.me",
-}
 
-SKIP_SCHEMES = ("javascript:", "mailto:", "tel:", "#")
+# -----------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------
 
-# NOTE: `/feed` removed here compared to the original extractor
-SKIP_PATTERNS = ("/share", "/print", "/wp-json", "/amp", "/?replytocom=")
+def make_abs(base_url: Optional[str], raw: str) -> Optional[str]:
+    """Convert raw link to absolute. Return None if cannot."""
+    if not raw:
+        return None
 
+    raw = raw.strip()
 
-# ------------------------- base url helpers ------------------------- #
-def guess_base_url_from_doc_or_url(doc: LH.HtmlElement, file_hint_url: Optional[str]) -> Optional[str]:
-    base = doc.cssselect("base[href]")
-    if base:
-        href = base[0].get("href")
-        if href and is_http(href):
-            return href
-    can = doc.cssselect("link[rel~='canonical'][href]")
-    if can:
-        href = can[0].get("href")
-        if href and is_http(href):
-            return href
-    og = doc.cssselect("meta[property='og:url'][content]")
-    if og:
-        href = og[0].get("content")
-        if href and is_http(href):
-            return href
-    if file_hint_url and is_http(file_hint_url):
-        p = urlparse(file_hint_url)
-        return f"{p.scheme}://{p.netloc}/"
+    # skip javascript / mailto / tel
+    low = raw.lower()
+    if low.startswith("javascript:") or low.startswith("mailto:") or low.startswith("tel:"):
+        return None
+
+    # protocol-relative: //domain.com/file.js
+    if raw.startswith("//") and base_url:
+        base = urlparse(base_url)
+        return f"{base.scheme}:{raw}"
+
+    # absolute already
+    if is_http(raw):
+        return norm_url(raw)
+
+    # relative
+    if base_url:
+        try:
+            return norm_url(urljoin(base_url, raw))
+        except Exception:
+            return None
+
     return None
 
 
-# ------------------------- page meta ------------------------- #
 def extract_page_meta(doc: LH.HtmlElement) -> Dict:
+    """Extract title, description, robots, canonical, language."""
     title = None
     tnode = doc.find(".//title")
     if tnode is not None and tnode.text:
         title = clean_space(tnode.text)
 
-    mdesc = None
-    mrobots = None
+    meta_description = None
+    meta_robots = None
     for m in doc.xpath("//meta[@name or @property]"):
         name = (m.get("name") or m.get("property") or "").lower()
         content = clean_space(m.get("content"))
         if not name:
             continue
         if name == "description":
-            mdesc = content
+            meta_description = content
         elif name == "robots":
-            mrobots = content
+            meta_robots = content
+
+    canonical = None
+    for l in doc.xpath("//link[@rel='canonical'][@href]"):
+        canonical = clean_space(l.get("href"))
+        break
 
     lang = clean_space(doc.get("lang") or doc.get("xml:lang"))
-    canonical = None
-    for l in doc.xpath("//link[contains(@rel,'canonical')][@href]"):
-        canonical = l.get("href")
-        break
 
     return {
         "title": title,
-        "meta_description": mdesc,
-        "meta_robots": mrobots,
+        "meta_description": meta_description,
+        "meta_robots": meta_robots,
         "canonical": canonical,
         "lang": lang or None,
     }
 
 
-def first_h1(doc: LH.HtmlElement) -> Optional[str]:
-    for h in doc.xpath("//h1"):
-        txt = clean_space(" ".join(h.itertext()))
-        if txt:
-            return txt
-    return None
+def extract_headings(doc: LH.HtmlElement) -> Dict[str, List[str]]:
+    out = {"h1": [], "h2": [], "h3": []}
+
+    for tag in ("h1", "h2", "h3"):
+        nodes = doc.xpath(f"//{tag}")
+        for h in nodes:
+            t = clean_space(" ".join(h.itertext()))
+            if t:
+                out[tag].append(t)
+
+    return out
 
 
-# ------------------------- article text & headings ------------------------- #
-def readability_fragment(html_text: str):
+def extract_text(html_text: str) -> str:
     doc = Document(html_text)
     try:
         summary_html = doc.summary(html_partial=True)
     except Exception:
-        summary_html = None
+        return ""
+
     if not summary_html:
-        return "", None
+        return ""
+
     try:
         frag = LH.fromstring(summary_html)
     except Exception:
-        frag = None
+        return ""
 
     lines = []
-    if frag is not None:
-        for node in frag.iter():
-            if node.tag in ("p", "li", "h2", "h3", "blockquote"):
-                t = clean_space(" ".join(node.itertext()))
-                if not t:
-                    continue
-                if t.lower().startswith(("table of contents", "toc")):
-                    continue
+    for node in frag.iter():
+        if node.tag in ("p", "li", "h2", "h3", "blockquote"):
+            t = clean_space(" ".join(node.itertext()))
+            if t:
                 lines.append(t)
 
     cleaned, prev = [], None
@@ -135,160 +135,153 @@ def readability_fragment(html_text: str):
             cleaned.append(ln)
         prev = ln
 
-    return "\n".join(cleaned).strip(), frag
+    return "\n".join(cleaned).strip()
 
 
-def extract_headings(frag: Optional[LH.HtmlElement]) -> Dict[str, List[str]]:
-    out: Dict[str, List[str]] = {"h2": [], "h3": []}
-    if frag is None:
-        return out
-    for tag in ("h2", "h3"):
-        for h in frag.xpath(f".//{tag}"):
-            t = clean_space(" ".join(h.itertext()))
-            if t:
-                out[tag].append(t)
-
-    def _clean(lst: List[str]) -> List[str]:
-        res: List[str] = []
-        seen = set()
-        for t in lst:
-            if not t:
-                continue
-            if t.lower().startswith("table of contents"):
-                continue
-            if t in seen:
-                continue
-            seen.add(t)
-            res.append(t)
-        return res
-
-    out["h2"] = _clean(out["h2"])
-    out["h3"] = _clean(out["h3"])
+def extract_images(doc: LH.HtmlElement, base_url: Optional[str]) -> List[Dict]:
+    out = []
+    for im in doc.xpath("//img[@src]"):
+        raw = im.get("src")
+        absu = make_abs(base_url, raw)
+        out.append({
+            "raw": raw,
+            "abs": absu,
+            "alt": clean_space(im.get("alt")),
+            "width": im.get("width"),
+            "height": im.get("height"),
+        })
     return out
 
 
-# ------------------------- links + anchors ------------------------- #
-def _filter_link(u: str) -> bool:
-    if not is_http(u):
-        return False
-    low = u.lower()
-    if any(low.startswith(s) for s in SKIP_SCHEMES):
-        return False
-    if any(p in low for p in SKIP_PATTERNS):
-        return False
-    netloc = urlparse(u).netloc.lower().split(":")[0]
-    if any(h in netloc for h in SOCIAL_HOSTS):
-        return False
-    return True
+# -----------------------------------------------------------
+# JSON-LD / dates extraction
+# -----------------------------------------------------------
 
+def extract_json_ld_dates(doc: LH.HtmlElement) -> Dict[str, Optional[str]]:
+    published = None
+    modified = None
 
-def _clean_anchor_text(txt: str) -> str:
-    t = re.sub(r"\s+", " ", (txt or "").strip())
-    return t[:160]
-
-
-def _anchor_of(a_node) -> str:
-    txt = _clean_anchor_text(" ".join(a_node.itertext()))
-    if not txt:
-        txt = _clean_anchor_text(a_node.get("title") or "")
-    return txt
-
-
-def links_from_fragment_with_anchors(frag: Optional[LH.HtmlElement], base_url: Optional[str]) -> List[Dict]:
-    if frag is None:
-        return []
-    out: List[Dict] = []
-    for a in frag.xpath(".//a[@href]"):
-        href = a.get("href")
-        if not href:
+    for node in doc.xpath("//script[@type='application/ld+json']"):
+        try:
+            data = json.loads(node.text or "")
+        except Exception:
             continue
-        absu = urljoin(base_url, href) if base_url and not is_http(href) else href
-        if not _filter_link(absu):
-            continue
-        out.append({"url": norm_url(absu), "anchor": _anchor_of(a) or None})
-    return out
 
+        items = data if isinstance(data, list) else [data]
 
-def links_from_page_with_anchors(full_doc: LH.HtmlElement, base_url: Optional[str]) -> List[Dict]:
-    all_as = full_doc.xpath("//a[@href]")
-    skip_xpath = " | ".join(
-        [
-            "//header//a[@href]",
-            "//footer//a[@href]",
-            "//nav//a[@href]",
-            "//aside//a[@href]",
-            "//*[@class='site-header']//a[@href]",
-            "//*[@class='site-footer']//a[@href]",
-            "//*[@class='menu']//a[@href]",
-            "//*[@class='sidebar']//a[@href]",
-            "//*[@class='breadcrumbs']//a[@href]",
-            "//*[@class='share']//a[@href]",
-            "//*[@class='social']//a[@href]",
-            "//*[@class='tags']//a[@href]",
-        ]
-    )
-    bad_as = set(full_doc.xpath(skip_xpath)) if skip_xpath else set()
-
-    out: List[Dict] = []
-    for a in all_as:
-        if a in bad_as:
-            continue
-        href = a.get("href")
-        if not href:
-            continue
-        absu = urljoin(base_url, href) if base_url and not is_http(href) else href
-        if not _filter_link(absu):
-            continue
-        out.append({"url": norm_url(absu), "anchor": _anchor_of(a) or None})
-    return out
-
-
-def _dedup_link_items(items: List[Dict]) -> List[Dict]:
-    seen = set()
-    out: List[Dict] = []
-    for it in items:
-        url = it.get("url")
-        anc = (_clean_anchor_text(it.get("anchor") or "")).lower()
-        key = (url, anc)
-        if url and key not in seen:
-            seen.add(key)
-            out.append({"url": url, "anchor": it.get("anchor") or None})
-    return out
-
-
-def classify_link_items(items: List[Dict], base_url: Optional[str]) -> Dict:
-    items = _dedup_link_items(items)
-    if not base_url:
-        internal: List[Dict] = []
-        external = items
-    else:
-        b = host_key(base_url)
-        internal = []
-        external = []
         for it in items:
-            try:
-                if host_key(it["url"]) == b:
-                    internal.append(it)
-                else:
-                    external.append(it)
-            except Exception:
-                external.append(it)
+            if not isinstance(it, dict):
+                continue
 
-    total = len(internal) + len(external)
+            if not published:
+                published = it.get("datePublished")
+            if not modified:
+                modified = it.get("dateModified")
+
+            if published and modified:
+                break
+
     return {
-        "counts": {
-            "total": total,
-            "internal": len(internal),
-            "external": len(external),
-            "internal_ratio": round((len(internal) / total), 3) if total else 0.0,
-            "external_ratio": round((len(external) / total), 3) if total else 0.0,
-        },
-        "internal_links": internal,
-        "external_links": external,
+        "publish_date": published,
+        "modified_date": modified,
     }
 
 
-# ------------------------- main conversion ------------------------- #
+# -----------------------------------------------------------
+# ALL LINKS extractor
+# -----------------------------------------------------------
+
+def extract_all_links(doc: LH.HtmlElement, base_url: Optional[str]) -> Dict[str, List[Dict[str, Optional[str]]]]:
+    raw_links: List[str] = []
+
+    # <a>
+    for a in doc.xpath("//a[@href]"):
+        raw_links.append(a.get("href"))
+
+    # <link>
+    for l in doc.xpath("//link[@href]"):
+        raw_links.append(l.get("href"))
+
+    # <img>
+    for i in doc.xpath("//img[@src]"):
+        raw_links.append(i.get("src"))
+
+    # <script>
+    for s in doc.xpath("//script[@src]"):
+        raw_links.append(s.get("src"))
+
+    # <iframe>
+    for f in doc.xpath("//iframe[@src]"):
+        raw_links.append(f.get("src"))
+
+    # <source srcset>
+    for srcset in doc.xpath("//source[@srcset]"):
+        raw_links.append(srcset.get("srcset"))
+
+    # OpenGraph
+    raw_links += doc.xpath("//meta[@property='og:url']/@content")
+    raw_links += doc.xpath("//meta[@property='og:image']/@content")
+
+    # Meta refresh
+    for m in doc.xpath("//meta[@http-equiv='refresh']"):
+        content = m.get("content")
+        if content and "url=" in content.lower():
+            part = content.split("url=", 1)[1].strip()
+            raw_links.append(part)
+
+    # JSON-LD links
+    for node in doc.xpath("//script[@type='application/ld+json']"):
+        try:
+            data = json.loads(node.text or "")
+        except Exception:
+            continue
+
+        items = data if isinstance(data, list) else [data]
+
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            for key in ("url", "@id", "contentUrl", "mainEntityOfPage", "image"):
+                v = it.get(key)
+                if isinstance(v, str):
+                    raw_links.append(v)
+                if isinstance(v, list):
+                    for x in v:
+                        if isinstance(x, str):
+                            raw_links.append(x)
+
+    # Build objects: raw + abs
+    out_all = []
+    for raw in raw_links:
+        absu = make_abs(base_url, raw)
+        out_all.append({"raw": raw, "abs": absu})
+
+    # Classification (abs-only)
+    internal = []
+    external = []
+    host = host_key(base_url) if base_url else None
+
+    for obj in out_all:
+        absu = obj.get("abs")
+        if not absu or not host:
+            external.append(obj)
+            continue
+        if host_key(absu) == host:
+            internal.append(obj)
+        else:
+            external.append(obj)
+
+    return {
+        "all": out_all,
+        "internal": internal,
+        "external": external,
+    }
+
+
+# -----------------------------------------------------------
+# Main function
+# -----------------------------------------------------------
+
 def html_bytes_to_json(
     html_bytes: bytes,
     final_url: str,
@@ -300,65 +293,39 @@ def html_bytes_to_json(
     uhtml = to_unicode(html_bytes)
     full_doc = LH.fromstring(uhtml)
 
-    page = extract_page_meta(full_doc)
-    h1 = first_h1(full_doc)
-    base_url = base_override or guess_base_url_from_doc_or_url(full_doc, final_url)
+    # Base URL
+    base_url = base_override or final_url
 
-    text, frag = readability_fragment(uhtml)
-    headings = extract_headings(frag)
+    # Metadata
+    meta = extract_page_meta(full_doc)
+    headings = extract_headings(full_doc)
+    text = extract_text(uhtml)
+    images = extract_images(full_doc, base_url)
+    dates = extract_json_ld_dates(full_doc)
 
-    article_images: List[Dict] = []
-    if frag is not None:
-        for im in frag.xpath(".//img[@src]"):
-            src = im.get("src")
-            if not src:
-                continue
-            absu = urljoin(base_url, src) if base_url and not is_http(src) else src
-            if not is_http(absu):
-                continue
-            article_images.append(
-                {
-                    "src": norm_url(absu),
-                    "alt": clean_space(im.get("alt")),
-                    "width": im.get("width"),
-                    "height": im.get("height"),
-                }
-            )
+    # ALL LINKS
+    links = extract_all_links(full_doc, base_url)
 
-    meta_imgs: List[str] = []
-    meta_imgs += full_doc.xpath("//meta[@property='og:image']/@content")
-    meta_imgs += full_doc.xpath("//meta[@name='twitter:image']/@content")
-    flat_imgs = dedup([u for u in meta_imgs if is_http(u)] + [i["src"] for i in article_images])
-
-    link_items_article = links_from_fragment_with_anchors(frag, base_url)
-    link_items_page = links_from_page_with_anchors(full_doc, base_url)
-    links = classify_link_items(link_items_article + link_items_page, base_url)
-
-    words = count_words(text)
-    stats = {
-        "characters": len(text),
-        "words": words,
-        "reading_time_minutes": max(1, (words + 199) // 200),
-    }
-    lang_final = detect_lang_fallback(text, page.get("lang"))
-
+    # Final JSON
     data = {
-        "input": {"source": "memory", "final_url": final_url, "base_url": base_url},
-        "page": {**page, "lang": lang_final},
-        "article": {
-            "h1": h1,
-            "headings": headings,
-            "text": text,
-            "stats": stats,
-            "images": article_images,
+        "input": {
+            "final_url": final_url,
+            "base_url": base_url,
         },
-        "images": flat_imgs,
+        "page": {
+            **meta,
+            "headings": headings,
+            "publish_date": dates["publish_date"],
+            "modified_date": dates["modified_date"],
+        },
+        "article": {
+            "text": text,
+            "images": images,
+        },
         "links": links,
         "meta": {
             "generated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "app_version": "AB-2.1.0",
-            "schema_version": "onpage-seo-app.article.v1",
-            "extractors_used": ["readability", "lxml"],
+            "extractor": "extractorV",
         },
     }
 
