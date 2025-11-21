@@ -1,3 +1,7 @@
+# backend/app/main.py
+
+from __future__ import annotations
+
 import os
 import time
 import logging
@@ -33,14 +37,13 @@ ALLOWED_ORIGINS = [
 ]
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
 
-# Basic logger
 log = logging.getLogger("onpage_api")
 if not log.handlers:
     logging.basicConfig(level=logging.INFO)
 
 
 # ---------------------------------------------------------------------------
-# FastAPI app + CORS
+# FastAPI setup + CORS
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="OnPage SEO API", version="1.0.0")
@@ -57,13 +60,12 @@ limiter = RateLimiter(RATE_LIMIT_PER_MIN, window_seconds=60)
 
 
 # ---------------------------------------------------------------------------
-# Dependencies: auth + rate limit
+# Dependencies: authentication + rate limiting
 # ---------------------------------------------------------------------------
 
 def auth_dep(request: Request) -> None:
-    """Simple bearer-token auth using API_TOKEN env."""
+    """Simple bearer-token authentication."""
     if not API_TOKEN:
-        # No token configured -> no auth required
         return
 
     header_value = request.headers.get("Authorization", "")
@@ -116,11 +118,10 @@ def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
 
         log.info("[/analyze-page] url=%s keyword=%s", url_str, keyword_str)
 
-        # run_pipeline is expected to return (report_path, report_dict)
         report_path, report = run_pipeline(url=url_str, keyword=keyword_str)
 
         log.info(
-            "[/analyze-page] pipeline OK (report_path=%s, score=%s)",
+            "[/analyze-page] OK (report_path=%s, score=%s)",
             report_path,
             getattr(report, "score", None),
         )
@@ -140,7 +141,7 @@ def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
 
 
 # ---------------------------------------------------------------------------
-# Convenience endpoint to re-run and return just the raw report JSON
+# Convenience endpoint to re-run and return raw JSON report
 # ---------------------------------------------------------------------------
 
 @app.get("/report")
@@ -154,7 +155,7 @@ def get_report(
 
         report_path, report = run_pipeline(url=u, keyword=keyword)
 
-        log.info("[/report] pipeline OK (report_path=%s)", report_path)
+        log.info("[/report] OK (report_path=%s)", report_path)
         return JSONResponse(report, status_code=200)
     except Exception as e:
         log.exception("[/report] Unhandled error")
@@ -162,7 +163,7 @@ def get_report(
 
 
 # ---------------------------------------------------------------------------
-# Crawler endpoints
+# Crawler: start
 # ---------------------------------------------------------------------------
 
 @app.post("/crawl/", response_model=CrawlStatus)
@@ -171,13 +172,13 @@ async def start_crawl(
     body: CrawlBody | None = None,
 ) -> CrawlStatus:
     import sys
-
     print(f"[*] /crawl/ endpoint called - body={body}", file=sys.stderr)
+
     status_obj = start_crawl_job(body)
 
     def _background_with_debug(*args, **kwargs) -> None:
         print(
-            f"[*] [BG] run_crawl_job_sync called with args={args}, kwargs={kwargs}",
+            f"[*] [BG] run_crawl_job_sync called with args={args} kwargs={kwargs}",
             file=sys.stderr,
         )
         try:
@@ -187,14 +188,19 @@ async def start_crawl(
 
     background_tasks.add_task(_background_with_debug, status_obj.job_id, body)
     print("[*] Background crawl job scheduled!", file=sys.stderr)
+
     return status_obj
 
+
+# ---------------------------------------------------------------------------
+# Crawler: status
+# ---------------------------------------------------------------------------
 
 @app.get("/crawl/status", response_model=CrawlStatus)
 async def crawl_status() -> CrawlStatus:
     import sys
-
     print("[*] /crawl/status endpoint called", file=sys.stderr)
+
     status_obj = get_crawl_status()
     log.info(
         "[/crawl/status] job_id=%s status=%s",
@@ -205,23 +211,21 @@ async def crawl_status() -> CrawlStatus:
 
 
 # ---------------------------------------------------------------------------
-# Simple crawl report (latest crawl: page + links info)
+# Simple crawl report
 # ---------------------------------------------------------------------------
 
 @app.get("/crawl/report/simple")
 def simple_crawl_report():
     """
-    Return a simple list for the latest crawled domain.
+    Return simplified crawl results (from crawl_status.json).
 
-    Each item contains:
-      - page URL and HTTP status
-      - index_status / meta_robots
-      - internal_links: list of {url, status}
-      - external_links: list of {url, status}
-    Data is taken from the crawl status cache (crawl_status.json).
+    Each page entry includes:
+      - url, final_url, status
+      - index_status, meta_robots
+      - internal_links: list of {raw, abs, status}
+      - external_links: list of {raw, abs, status}
     """
     import sys
-
     print("[*] /crawl/report/simple endpoint called", file=sys.stderr)
 
     status_obj = get_crawl_status()
@@ -232,10 +236,6 @@ def simple_crawl_report():
     )
 
     if not status_obj.reports or len(status_obj.reports) == 0:
-        log.warning(
-            "[/crawl/report/simple] No reports available (status=%s)",
-            status_obj.status,
-        )
         return JSONResponse(
             content={
                 "error": "No crawl report available yet",
@@ -245,29 +245,26 @@ def simple_crawl_report():
             status_code=404,
         )
 
-    # For now we assume a single-domain crawl and use the first report
     report = status_obj.reports[0]
-
     simple = []
-    for page in report.pages:
-        # extra debug per page (can be noisy but useful while testing)
-        log.debug(
-            "[/crawl/report/simple] page url=%s status=%s internal=%d external=%d",
-            page.url,
-            page.status,
-            len(page.internal_links),
-            len(page.external_links),
-        )
 
-        simple.append(
-            {
-                "url": page.url,
-                "status": page.status,
-                "index_status": page.index_status,
-                "meta_robots": page.meta_robots,
-                "internal_links": [link.dict() for link in page.internal_links],
-                "external_links": [link.dict() for link in page.external_links],
-            }
-        )
+    for page in report.pages:
+        simple.append({
+            "url": page.url,
+            "final_url": page.final_url,
+            "status": page.status,
+            "index_status": page.index_status,
+            "meta_robots": page.meta_robots,
+
+            "internal_links": [
+                {"raw": link.raw, "abs": link.abs, "status": link.status}
+                for link in page.internal_links
+            ],
+
+            "external_links": [
+                {"raw": link.raw, "abs": link.abs, "status": link.status}
+                for link in page.external_links
+            ],
+        })
 
     return JSONResponse(content=simple, status_code=200)
